@@ -1,0 +1,8 @@
+days_since_order
+customer_total_returns
+total_amount
+is_repeat_offender
+category_Beauty
+category_Electronics
+category_Home & Kitchen
+category_Sports

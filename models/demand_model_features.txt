@@ -1,0 +1,17 @@
+lag_1
+lag_7
+roll_mean_7
+roll_mean_14
+roll_mean_30
+roll_std_7
+trend_14
+day_of_week
+is_weekend
+month
+day_of_month
+price
+is_promo
+category_Beauty
+category_Electronics
+category_Home & Kitchen
+category_Sports
