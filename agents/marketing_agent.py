@@ -26,6 +26,7 @@ import sys
 sys.path.append(os.path.dirname(__file__))
 from inventory_agent import check_inventory, load_model as load_demand_model
 from pricing_agent import get_pricing_suggestions
+from forecasting_agent import forecast_all_products
 
 DB_PATH = "data/ecommerce.db"
 
@@ -119,6 +120,101 @@ def get_draft_emails(conn):
         emails.append(draft_clearance_email(suggestion))
 
     return emails
+
+
+# ---------------------------------------------------------------------
+# Promotion ideas (BOGO, free gift, bundle suggestions)
+# ---------------------------------------------------------------------
+
+
+def find_top_selling_in_category(conn, category, exclude_product_id=None):
+    """Return a product_id and name for a top-selling product in the same category.
+    Uses recent orders to pick a sensible free-gift or bundle partner.
+    """
+    q = (
+        "SELECT p.product_id, p.name, COALESCE(SUM(o.quantity),0) as sold "
+        "FROM products p LEFT JOIN orders o ON p.product_id = o.product_id "
+        "WHERE p.category = ?"
+    )
+    params = [category]
+    if exclude_product_id is not None:
+        q += " AND p.product_id != ?"
+        params.append(exclude_product_id)
+    q += " GROUP BY p.product_id ORDER BY sold DESC LIMIT 1"
+
+    row = conn.execute(q, params).fetchone()
+    if row:
+        return {"product_id": row[0], "name": row[1]}
+    return None
+
+
+def generate_promo_ideas(conn, max_ideas=10):
+    """Generate simple, rule-based promotional ideas for marketing.
+
+    Returns a list of suggestion dicts with keys: `type`, `title`, `description`,
+    and `products` (list of involved product ids/names).
+    """
+    model, feature_cols = load_demand_model()
+    inventory_results = check_inventory(conn, model, feature_cols)
+    pricing_suggestions = get_pricing_suggestions(conn)
+    forecasts = forecast_all_products(conn, model, feature_cols)
+    forecast_by_id = {f["product_id"]: f for f in forecasts}
+
+    ideas = []
+
+    # 1) For pricing suggestions (overstocked + falling demand) propose BOGO or bundle
+    for s in pricing_suggestions:
+        if len(ideas) >= max_ideas:
+            break
+        pid = s["product_id"]
+        days = float(s.get("days_of_stock", 0))
+        # pick partner product from same category if available
+        partner = find_top_selling_in_category(conn, s["category"], exclude_product_id=pid)
+
+        if days >= 45:
+            # heavy stock -> strong action: BOGO or free accessory
+            if partner:
+                title = f"Bundle: Buy 1 {s['name']} + get {partner['name']} free"
+                desc = (
+                    f"Move excess {s['name']} by bundling it with popular {partner['name']} in {s['category']}. "
+                    f"Offer the partner item free or at a heavy discount when customers buy {s['name']}."
+                )
+                products = [ {"product_id": pid, "name": s['name']}, partner ]
+            else:
+                title = f"BOGO: Buy one get one free on {s['name']}"
+                desc = (
+                    f"Offer a BOGO promotion on {s['name']} to quickly reduce large stock levels. "
+                    f"This is recommended because stock lasts ~{days} days and demand is falling ({s['demand_trend_pct']}%)."
+                )
+                products = [{"product_id": pid, "name": s['name']}]
+
+            ideas.append({"type": "bundle", "title": title, "description": desc, "products": products, "urgency": s.get("urgency")})
+        else:
+            # moderate stock -> light promotion or free gift
+            title = f"Offer: Free gift with purchase of {s['name']}"
+            desc = (
+                f"Encourage purchases of {s['name']} by including a small free gift or trial-sized item. "
+                f"Useful when demand is falling but stock isn't extremely high.")
+            products = [{"product_id": pid, "name": s['name']}]
+            ideas.append({"type": "free_gift", "title": title, "description": desc, "products": products, "urgency": s.get("urgency")})
+
+    # 2) For products with falling demand but not in pricing suggestions (caught earlier), propose light promos
+    for item in inventory_results:
+        if len(ideas) >= max_ideas:
+            break
+        pid = item["product_id"]
+        f = forecast_by_id.get(pid)
+        if not f:
+            continue
+        demand_change_pct = ((f["predicted_daily_demand"] - f["recent_7day_avg"]) / f["recent_7day_avg"]) * 100 if f["recent_7day_avg"] not in (None, 0) else 0
+        if demand_change_pct < 0 and not any(i for i in ideas if any(p["product_id"]==pid for p in i.get("products",[]))):
+            title = f"Email idea: Highlight {item['name']} in a targeted campaign"
+            desc = (
+                f"Draft a targeted email or social post highlighting {item['name']} with a small incentive (free shipping, 5% off) to reignite interest."
+            )
+            ideas.append({"type": "email_prompt", "title": title, "description": desc, "products": [{"product_id": pid, "name": item['name']}], "urgency": item.get("status")})
+
+    return ideas
 
 
 # ---------------------------------------------------------------------

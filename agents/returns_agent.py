@@ -122,11 +122,20 @@ def review_pending_returns(conn):
     if pending.empty:
         return []
 
-    # Build feature matrix matching training format exactly
-    features_df = pd.get_dummies(pending, columns=["category"])
+    # NEW: days_past_window -- how far past the CATEGORY-SPECIFIC policy
+    # deadline this return is (0 if within policy). This is a stronger,
+    # more meaningful signal than raw days_since_order alone, and must be
+    # computed the exact same way it was during training.
+    pending["return_window"] = pending["category"].map(CATEGORY_RETURN_WINDOW_DAYS).fillna(DEFAULT_RETURN_WINDOW_DAYS)
+    pending["days_past_window"] = (pending["days_since_order"] - pending["return_window"]).clip(lower=0)
+
+    # Build feature matrix matching training format exactly -- both
+    # category AND reason are one-hot encoded, since the retrained model
+    # now uses reason as a real input feature too.
+    features_df = pd.get_dummies(pending, columns=["category", "reason"])
     for col in feature_cols:
-        if col.startswith("category_") and col not in features_df.columns:
-            features_df[col] = 0  # category not present in this batch -> 0, matches training format
+        if (col.startswith("category_") or col.startswith("reason_")) and col not in features_df.columns:
+            features_df[col] = 0  # value not present in this batch -> 0, matches training format
 
     X = features_df[feature_cols]
     risk_probabilities = model.predict_proba(X)[:, 1]  # probability of class "flagged"

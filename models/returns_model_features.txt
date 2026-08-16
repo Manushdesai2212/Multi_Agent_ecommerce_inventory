@@ -1,4 +1,5 @@
 days_since_order
+days_past_window
 customer_total_returns
 total_amount
 is_repeat_offender
@@ -6,3 +7,9 @@ category_Beauty
 category_Electronics
 category_Home & Kitchen
 category_Sports
+reason_Found cheaper elsewhere
+reason_Item damaged on arrival
+reason_Item not as described
+reason_Quality not as expected
+reason_Received wrong item
+reason_Wrong size / doesn't fit

@@ -65,6 +65,18 @@ CATEGORY_RETURN_RATE = {
     "Sports":         0.08,
 }
 
+# Must match returns_agent.py's CATEGORY_RETURN_WINDOW_DAYS -- used here to
+# generate REALISTIC return timing, since most real return requests happen
+# within the policy window (that's when customers are even able to submit
+# one); only a small minority arrive late.
+CATEGORY_RETURN_WINDOW = {
+    "Electronics":    7,
+    "Apparel":        15,
+    "Home & Kitchen": 7,
+    "Beauty":         7,
+    "Sports":         7,
+}
+
 SHOCK_PROBABILITY = 0.03
 PROMO_PROBABILITY = 0.02
 
@@ -77,6 +89,21 @@ RETURN_REASONS = [
     "Found cheaper elsewhere",
     "Quality not as expected",
 ]
+
+# How much each reason contributes to risk -- reasons that are clearly the
+# seller's fault (damaged, wrong item shipped) are treated as legitimate
+# and add no risk. Discretionary reasons (buyer's remorse, price shopping)
+# add meaningfully more risk, since they're the reasons most associated
+# with policy abuse in real return data.
+REASON_RISK_WEIGHT = {
+    "Item damaged on arrival":  0.0,
+    "Received wrong item":      0.0,
+    "Wrong size / doesn't fit": 0.2,
+    "Item not as described":    0.3,
+    "Quality not as expected":  0.3,
+    "Changed my mind":          1.2,
+    "Found cheaper elsewhere":  1.5,
+}
 
 
 def build_database():
@@ -288,18 +315,34 @@ def generate_orders_and_returns(conn, product_ids, customer_ids, repeat_offender
 
         if gets_returned:
             order_date = datetime.fromisoformat(order_date_str).date()
-            days_since_order = max(1, int(random.gauss(15, 12)))
+            # Realistic timing: most return requests happen WITHIN the
+            # category's actual policy window (that's when customers are
+            # even able to submit one) -- only a minority arrive late.
+            # An exponential distribution scaled to ~55% of the window
+            # naturally produces this shape: most mass under the window,
+            # a smaller decaying tail beyond it (a late-but-plausible
+            # request, or someone asking for a goodwill exception).
+            window = CATEGORY_RETURN_WINDOW.get(category, 7)
+            days_since_order = max(1, int(random.expovariate(1 / (window * 0.55))))
             return_date = order_date + timedelta(days=days_since_order)
             reason = random.choice(RETURN_REASONS)
 
             customer_return_counts[customer_id] += 1
             total_returns_so_far = customer_return_counts[customer_id]
 
+            # days_past_window directly captures POLICY VIOLATION SEVERITY --
+            # a much more meaningful signal than raw days_since_order alone,
+            # since "10 days for a 7-day window" (3 days over) is very
+            # different from "10 days for a 15-day window" (still within).
+            days_past_window = max(0, days_since_order - window)
+
             risk_score = (
-                0.03 * days_since_order
+                0.18 * days_past_window        # strong weight -- how far past policy, not just raw days
+                + 0.015 * days_since_order      # small residual weight on raw timing too
                 + 0.5 * total_returns_so_far
                 + (1.5 if is_repeat_offender else 0)
-                + random.gauss(0, 1.0)
+                + REASON_RISK_WEIGHT.get(reason, 0.5)
+                + random.gauss(0, 0.8)
             )
             flag_probability = 1 / (1 + np.exp(-(risk_score - 3)))
             is_flagged = int(random.random() < flag_probability)

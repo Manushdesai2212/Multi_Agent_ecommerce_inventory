@@ -151,28 +151,107 @@ def simulate_return(conn, product_id, reason, days_since_order=15, customer_id=N
     }
 
 
-def simulate_demand_drop(conn, product_id, days=10, reduction_pct=60):
+def simulate_increase_stock(conn, product_id, add_quantity):
     """
-    DEMO-ONLY TOOL: artificially reduces a product's units_sold over the
-    last N days in sales_history, so you can trigger and show the Pricing
-    Agent's "overstocked + falling demand" discount logic live.
+    Demo-only helper: increase a product's stock quantity by `add_quantity`.
+    Updates the `products.stock_qty` and logs the change to `agent_logs`
+    (keeps an audit trail similar to other agent actions).
 
-    This does NOT reflect real customer behavior -- it's purely to make
-    the demo controllable rather than waiting for the random dataset to
-    naturally produce this scenario. State this clearly if you use it in
-    your viva demo.
+    Returns a dict summarizing the change.
     """
     cur = conn.cursor()
-    cutoff_date = (datetime.now().date() - timedelta(days=days)).isoformat()
+
+    product = cur.execute(
+        "SELECT stock_qty, name FROM products WHERE product_id = ?", (product_id,)
+    ).fetchone()
+    if product is None:
+        raise ValueError(f"Product {product_id} not found")
+
+    current_stock, name = product
+    new_stock = current_stock + int(add_quantity)
+    cur.execute("UPDATE products SET stock_qty = ? WHERE product_id = ?", (new_stock, product_id))
+
+    # Optional: add an audit row in agent_logs so UI owners can see the change
+    try:
+        cur.execute(
+            "INSERT INTO agent_logs (timestamp, agent_name, action, details) VALUES (?, ?, ?, ?)",
+            (datetime.now().isoformat(), "Simulator", "increase_stock", f"{{\"product_id\": {product_id}, \"old\": {current_stock}, \"new\": {new_stock}}}"),
+        )
+    except Exception:
+        # don't fail the operation if agent_logs is missing or insertion fails
+        pass
+
+    conn.commit()
+    return {"product_name": name, "old_stock": current_stock, "new_stock": new_stock, "added": int(add_quantity)}
+
+
+def simulate_demand_drop(conn, product_id, days=30, reduction_pct=70, protect_recent_days=7):
+    """
+    DEMO-ONLY TOOL: artificially lowers a product's recent demand signal,
+    so you can trigger and show the Pricing Agent's "overstocked + falling
+    demand" discount logic live.
+
+    DESIGN HISTORY (kept here because the reasoning matters and isn't
+    obvious): earlier versions tried (1) a flat uniform cut across all
+    days, and (2) a linear ramp that crashed the MOST RECENT days hardest.
+    Both were tested empirically and BOTH FAILED to produce a "falling"
+    signal -- version (2) reliably produced the OPPOSITE result (demand
+    looked like it was RISING).
+
+    Why: the demand model's prediction is dominated by roll_mean_30 (a
+    30-day average). The Pricing Agent compares that prediction against
+    recent_7day_avg (a simple last-7-days average computed separately).
+    If you crash the recent days hardest, recent_7day_avg craters while
+    roll_mean_30 (mostly built from the untouched older days) stays
+    relatively high -- so predicted demand ends up HIGHER than the
+    crashed recent average, which reads as "recovering/rising", not
+    falling.
+
+    THE FIX: do the opposite. Leave the most recent `protect_recent_days`
+    completely untouched (so recent_7day_avg stays at its real level),
+    and crash the OLDER portion of the window instead. This pulls
+    roll_mean_30 down while the recent comparison baseline stays where it
+    was -- reliably producing predicted < recent_7day_avg, i.e. a real
+    "falling demand" signal. Verified empirically across multiple
+    products before shipping this version.
+
+    This does NOT reflect real customer behavior -- it's purely to make
+    the demo controllable. State this clearly if you use it in your viva.
+    """
+    cur = conn.cursor()
+
+    # CRITICAL: anchor to the LATEST DATE ACTUALLY PRESENT in sales_history
+    # for this product, NOT wall-clock "today" (datetime.now()). These can
+    # drift apart significantly -- the database's data stops wherever
+    # generate_data.py was last run, while real calendar time keeps moving
+    # forward. The demand forecasting model (demand_utils.build_feature_row)
+    # always looks at the most recent ROWS PRESENT in the table, not real
+    # calendar dates -- so this simulation must anchor the same way, or it
+    # can end up editing rows the model never even looks at.
+    latest_date_row = cur.execute(
+        "SELECT MAX(sale_date) FROM sales_history WHERE product_id = ?", (product_id,)
+    ).fetchone()
+    if latest_date_row is None or latest_date_row[0] is None:
+        return {"rows_updated": 0, "reduction_pct": reduction_pct}
+    latest_date = datetime.fromisoformat(latest_date_row[0]).date()
+    cutoff_date = (latest_date - timedelta(days=days)).isoformat()
 
     rows = cur.execute(
-        "SELECT sale_id, units_sold FROM sales_history WHERE product_id = ? AND sale_date >= ?",
+        "SELECT sale_id, sale_date, units_sold FROM sales_history WHERE product_id = ? AND sale_date >= ? ORDER BY sale_date ASC",
         (product_id, cutoff_date),
     ).fetchall()
 
-    for sale_id, units_sold in rows:
-        reduced = max(0, int(units_sold * (1 - reduction_pct / 100)))
-        cur.execute("UPDATE sales_history SET units_sold = ? WHERE sale_id = ?", (reduced, sale_id))
+    total_rows = len(rows)
+    if total_rows == 0:
+        return {"rows_updated": 0, "reduction_pct": reduction_pct}
+
+    protect_from_idx = max(0, total_rows - protect_recent_days)
+    updated = 0
+    for idx, (sale_id, sale_date, units_sold) in enumerate(rows):
+        if idx < protect_from_idx:  # only touch the OLDER portion of the window
+            reduced = max(0, int(units_sold * (1 - reduction_pct / 100)))
+            cur.execute("UPDATE sales_history SET units_sold = ? WHERE sale_id = ?", (reduced, sale_id))
+            updated += 1
 
     conn.commit()
-    return {"rows_updated": len(rows), "reduction_pct": reduction_pct}
+    return {"rows_updated": updated, "reduction_pct": reduction_pct}

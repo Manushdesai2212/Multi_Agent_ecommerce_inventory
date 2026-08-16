@@ -56,10 +56,16 @@ def build_feature_row(conn, product_id, feature_cols, assume_promo=0):
     trend_14 = roll_mean_7 - roll_mean_14 if len(recent_values) >= 14 else 0
 
     # Get product's category and price
-    product_info = pd.read_sql(
+    product_lookup = pd.read_sql(
         "SELECT category, price FROM products WHERE product_id = ?",
         conn, params=(product_id,),
-    ).iloc[0]
+    )
+    if product_lookup.empty:
+        # Product not found -- e.g. a stale/inconsistent DB state.
+        # Skip gracefully instead of crashing the whole dashboard, same
+        # as the "no sales history yet" case above.
+        return None
+    product_info = product_lookup.iloc[0]
 
     row = {
         "lag_1": lag_1,

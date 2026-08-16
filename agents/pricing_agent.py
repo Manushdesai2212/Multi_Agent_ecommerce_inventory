@@ -33,32 +33,38 @@ DB_PATH = "data/ecommerce.db"
 # a black-box formula, so it's easy to explain and adjust in a viva.
 def compute_discount(days_of_stock, demand_change_pct):
     """
-    days_of_stock: how many days current stock will last at predicted demand
-    demand_change_pct: % change vs recent average (negative = falling)
+    Decide a suggested discount and urgency for a product given its
+    days_of_stock and percent change in demand (predicted vs recent).
 
-    Returns (discount_pct, urgency_level). Returns (0, None) if no discount
-    is warranted.
+    New policy (per user request):
+      - Any product with falling demand (demand_change_pct < 0) should
+        appear in the Pricing suggestions list (even if not overstocked).
+      - If a product is BOTH overstocked (many days_of_stock) AND has
+        sustained low demand, mark it as higher urgency / larger discount.
 
-    IMPORTANT: a discount is only suggested when stock is high AND demand
-    is genuinely falling. High stock with STABLE or RISING demand is not
-    flagged here -- that inventory will naturally sell through as demand
-    catches up, so a discount would be an unnecessary markdown. This was
-    a real bug in the earlier version, which suggested discounts even for
-    overstocked products with rising demand.
+    Returns (discount_pct, urgency_level). Returns (0, None) if demand
+    is stable or rising.
     """
-    if days_of_stock < 45:
-        return 0, None  # not overstocked enough to warrant a discount
-
     if demand_change_pct >= 0:
-        return 0, None  # demand stable or rising -- overstock will likely resolve naturally
+        return 0, None  # only consider products with falling demand
 
-    # From here, stock is high AND demand is genuinely falling -- a real problem
+    # Heavily stocked AND falling demand -> escalate urgency and size
+    if days_of_stock >= 45:
+        if demand_change_pct <= -30:
+            return 25, "High"
+        elif demand_change_pct <= -15:
+            return 15, "High"
+        else:
+            return 10, "High"
+
+    # Falling demand but not (yet) overstocked -> show advisory suggestion
+    # so business owners are aware and can monitor or act early.
     if demand_change_pct <= -30:
-        return 20, "High"
-    elif demand_change_pct <= -15:
         return 12, "Medium"
-    else:
+    elif demand_change_pct <= -15:
         return 8, "Low"
+    else:
+        return 5, "Low"
 
 
 def log_action(conn, action, details):
@@ -85,9 +91,11 @@ def get_pricing_suggestions(conn):
     forecast_by_id = {r["product_id"]: r for r in forecast_results}
 
     suggestions = []
-    overstocked = [r for r in inventory_results if r["status"] == "overstocked"]
 
-    for item in overstocked:
+    # New behavior: consider ALL products with falling demand, not just
+    # those currently flagged as overstocked. Inventory status still
+    # influences the urgency/size of the suggested discount.
+    for item in inventory_results:
         pid = item["product_id"]
         forecast = forecast_by_id.get(pid)
         if forecast is None or forecast["recent_7day_avg"] in (None, 0):

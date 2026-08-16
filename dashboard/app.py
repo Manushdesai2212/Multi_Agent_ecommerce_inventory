@@ -21,17 +21,32 @@ sys.path.append(os.path.join(os.path.dirname(__file__), "..", "agents"))
 from inventory_agent import check_inventory, load_model as load_demand_model
 from forecasting_agent import forecast_all_products
 from pricing_agent import get_pricing_suggestions
-from marketing_agent import get_draft_emails, generate_performance_summary
+from marketing_agent import get_draft_emails, generate_performance_summary, generate_promo_ideas
 from returns_agent import review_pending_returns, record_owner_decision
-from simulate import simulate_order, simulate_demand_drop, simulate_return
+
+# Import simulate module and explicitly reload it to ensure Streamlit's
+# autoreload/re-run behavior picks up recent edits (prevents stale imports)
+import importlib
+import simulate as simulate_mod
+importlib.reload(simulate_mod)
+from simulate import simulate_order, simulate_demand_drop, simulate_return, simulate_increase_stock
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "ecommerce.db")
 
 st.set_page_config(page_title="E-commerce AI Operations", layout="wide")
 
 
-@st.cache_resource
 def get_connection():
+    """
+    Deliberately NOT cached with @st.cache_resource. A cached connection
+    can go stale if the underlying ecommerce.db file gets deleted and
+    rebuilt (e.g. re-running generate_data.py) while the dashboard is
+    still running -- this caused a real crash (IndexError: product not
+    found) because the app kept using a connection pointing at an
+    inconsistent mid-rebuild state of the file. SQLite connection
+    overhead at this project's scale is negligible, so opening fresh
+    each rerun is simply safer.
+    """
     return sqlite3.connect(DB_PATH, check_same_thread=False)
 
 
@@ -147,7 +162,7 @@ elif page == "Inventory & Forecast":
     st.dataframe(
         df_filtered[["name", "category", "current_stock", "reorder_level",
                       "predicted_daily_demand", "days_until_stockout", "status"]],
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
     )
 
@@ -226,7 +241,7 @@ elif page == "Pricing & Discounts":
                 "Stock lasts (days)": item["days_until_stockout"],
                 "Demand trend": f"+{trend_pct}%" if trend_pct and trend_pct >= 0 else f"{trend_pct}%" if trend_pct is not None else "N/A",
             })
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
 
 
 # ---------------------------------------------------------------------
@@ -247,6 +262,20 @@ elif page == "Marketing & Reporting":
                 col1, col2 = st.columns(2)
                 col1.button("Send", key=f"send_{i}")
                 col2.button("Discard", key=f"discard_{i}")
+
+        st.divider()
+        st.subheader("Promotional ideas")
+        st.caption("Automated campaign ideas (BOGO, bundle with free gift, targeted email prompts) based on inventory and demand signals.")
+        ideas = generate_promo_ideas(conn)
+        if not ideas:
+            st.write("No promo ideas right now.")
+        else:
+            for idx, idea in enumerate(ideas):
+                with st.container(border=True):
+                    st.markdown(f"**{idea['title']}**")
+                    st.write(idea['description'])
+                    prod_names = ", ".join([p['name'] for p in idea.get('products',[])])
+                    st.caption(f"Products: {prod_names} | Urgency: {idea.get('urgency')}")
 
     with tab2:
         summary_text, stats = cached_summary(conn)
@@ -281,7 +310,12 @@ elif page == "Returns":
                 col1, col2 = st.columns([4, 1])
                 with col1:
                     st.markdown(f"**Return #{r['return_id']}** -- {r['category']}, reason: {r['reason']}")
-                    st.markdown(f":{badge_color}[{r['risk_level']} risk] ({r['risk_probability']:.0%})")
+                    badges = f":{badge_color}[{r['risk_level']} risk] ({r['risk_probability']:.0%})"
+                    if not r["within_policy"]:
+                        badges += "  &nbsp;&nbsp; :orange[**\u26a0\ufe0f Policy Exception**]"
+                    st.markdown(badges)
+                    if not r["within_policy"]:
+                        st.caption("This return is outside the standard policy window. Approving it means consciously granting an exception, not a routine approval.")
                     with st.expander("Why this risk level?"):
                         st.write(r["reasoning"])
                 with col2:
@@ -385,3 +419,21 @@ elif page == "Simulate Activity":
         )
         st.cache_data.clear()
         st.info("Now go to the Returns page to see the live risk assessment for this return.")
+
+    st.divider()
+
+    st.subheader("Adjust product stock")
+    st.caption("Increase a product's stock quantity for demoing inventory/ordering scenarios.")
+
+    stock_product = st.selectbox("Product to increase stock for", products_df["name"], key="stock_product")
+    add_qty = st.number_input("Add quantity", min_value=1, max_value=10000, value=50)
+
+    if st.button("Increase stock"):
+        pid = int(products_df[products_df["name"] == stock_product]["product_id"].values[0])
+        try:
+            result = simulate_increase_stock(conn, pid, add_qty)
+            st.success(f"Stock increased: {result['product_name']}: {result['old_stock']} -> {result['new_stock']}")
+            st.cache_data.clear()
+            st.info("Stock updated — check Inventory & Forecast or Pricing & Discounts to see agents react.")
+        except Exception as e:
+            st.error(str(e))
